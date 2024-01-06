@@ -31,6 +31,7 @@
 #include <stb_image_write.h>
 #include <stb_image_resize2.h>
 #include <d3dcompiler.h>
+#include <dxcapi.h>
 
 bool resolve_path(std::filesystem::path &path, std::error_code &ec)
 {
@@ -1741,7 +1742,7 @@ bool reshade::runtime::load_effect(const std::filesystem::path &source_file, con
 		else if (_renderer_id < 0xc000)
 			shader_model = 50; // D3D11
 		else
-			shader_model = 51; // D3D12
+			shader_model = GetProcAddress(static_cast<HMODULE>(_d3d_compiler_module), "DxcCreateInstance") != nullptr ? 60 : 51; // D3D12
 
 		std::unique_ptr<reshadefx::codegen> codegen;
 		if ((_renderer_id & 0xF0000) == 0)
@@ -1943,6 +1944,15 @@ bool reshade::runtime::load_effect(const std::filesystem::path &source_file, con
 
 				switch (_renderer_id)
 				{
+				case D3D_FEATURE_LEVEL_12_0:
+				case D3D_FEATURE_LEVEL_12_1:
+				case D3D_FEATURE_LEVEL_12_2:
+					if (GetProcAddress(static_cast<HMODULE>(_d3d_compiler_module), "DxcCreateInstance") != nullptr)
+					{
+						profile += "_6_0";
+						break;
+					}
+					[[fallthrough]];
 				default:
 				case D3D_FEATURE_LEVEL_11_0:
 					profile += "_5_0";
@@ -1987,77 +1997,158 @@ bool reshade::runtime::load_effect(const std::filesystem::path &source_file, con
 
 				if (!load_effect_cache(cache_id, "cso", cso))
 				{
-					const auto D3DCompile = reinterpret_cast<pD3DCompile>(GetProcAddress(static_cast<HMODULE>(_d3d_compiler_module), "D3DCompile"));
-					assert(D3DCompile != nullptr);
-
-					com_ptr<ID3DBlob> d3d_compiled, d3d_errors;
-					const HRESULT hr = D3DCompile(
-						hlsl.data(), hlsl.size(),
-						nullptr, entry_point.type == reshadefx::shader_type::ps ? ps_defines : nullptr, nullptr,
-						entry_point.name.c_str(),
-						profile.c_str(),
-						compile_flags, 0,
-						&d3d_compiled, &d3d_errors);
-
-					std::string d3d_errors_string;
-					if (d3d_errors != nullptr) // Append warnings to the output error string as well
-						d3d_errors_string.assign(static_cast<const char *>(d3d_errors->GetBufferPointer()), d3d_errors->GetBufferSize() - 1); // Subtracting one to not append the null-terminator as well
-					d3d_errors.reset();
-
-					// De-duplicate error lines (D3DCompiler sometimes repeats the same error multiple times)
-					for (size_t line_offset = 0, next_line_offset; (next_line_offset = d3d_errors_string.find('\n', line_offset)) != std::string::npos; line_offset = next_line_offset + 1)
+					const auto DxcCreateInstance = reinterpret_cast<DxcCreateInstanceProc>(GetProcAddress(static_cast<HMODULE>(_d3d_compiler_module), "DxcCreateInstance"));
+					if (DxcCreateInstance != nullptr)
 					{
-						const std::string_view cur_line(d3d_errors_string.data() + line_offset, next_line_offset - line_offset);
+						com_ptr<IDxcCompiler3> compiler;
+						DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler));
+						assert(compiler != nullptr);
 
-						if (const size_t end_offset = d3d_errors_string.find('\n', next_line_offset + 1);
-							end_offset != std::string::npos)
+						DxcBuffer hlsl_buffer;
+						hlsl_buffer.Ptr = hlsl.data();
+						hlsl_buffer.Size = hlsl.size();
+						hlsl_buffer.Encoding = DXC_CP_UTF8;
+
+						std::wstring entry_point_name;
+						utf8::unchecked::utf8to16(entry_point.name.begin(), entry_point.name.end(), std::back_inserter(entry_point_name));
+						std::wstring profile_wide;
+						utf8::unchecked::utf8to16(profile.begin(), profile.end(), std::back_inserter(profile_wide));
+
+						LPCWSTR arguments[] = {
+							L"-E", entry_point_name.c_str(),
+							L"-T", profile_wide.c_str(),
+							L"-Zi",
+							L"-Wno-ignored-attributes",
+						};
+
+						com_ptr<IDxcResult> result;
+						HRESULT hr = compiler->Compile(&hlsl_buffer, arguments, static_cast<UINT32>(std::size(arguments)), nullptr, IID_PPV_ARGS(&result));
+
+						if (result != nullptr)
 						{
-							const std::string_view next_line(d3d_errors_string.data() + next_line_offset + 1, end_offset - next_line_offset - 1);
-							if (cur_line == next_line)
+							result->GetStatus(&hr);
+
+							if (com_ptr<IDxcBlobUtf8> d3d_errors;
+								SUCCEEDED(result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&d3d_errors), nullptr)))
+								effect.errors.append(static_cast<const char *>(d3d_errors->GetBufferPointer()), d3d_errors->GetBufferSize());
+						}
+
+						if (FAILED(hr))
+						{
+							effect.compiled = false;
+							break;
+						}
+
+						if (com_ptr<IDxcBlob> d3d_compiled;
+							SUCCEEDED(result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&d3d_compiled), nullptr)))
+						{
+							cso.resize(d3d_compiled->GetBufferSize());
+							std::memcpy(cso.data(), d3d_compiled->GetBufferPointer(), cso.size());
+						}
+						else
+						{
+							effect.compiled = false;
+						}
+					}
+					else
+					{
+						const auto D3DCompile = reinterpret_cast<pD3DCompile>(GetProcAddress(static_cast<HMODULE>(_d3d_compiler_module), "D3DCompile"));
+						assert(D3DCompile != nullptr);
+
+						com_ptr<ID3DBlob> d3d_compiled, d3d_errors;
+						const HRESULT hr = D3DCompile(
+							hlsl.data(), hlsl.size(),
+							nullptr, entry_point.type == reshadefx::shader_type::ps ? ps_defines : nullptr, nullptr,
+							entry_point.name.c_str(),
+							profile.c_str(),
+							compile_flags, 0,
+							&d3d_compiled, &d3d_errors);
+
+						std::string d3d_errors_string;
+						if (d3d_errors != nullptr) // Append warnings to the output error string as well
+							d3d_errors_string.assign(static_cast<const char *>(d3d_errors->GetBufferPointer()), d3d_errors->GetBufferSize() - 1); // Subtracting one to not append the null-terminator as well
+						d3d_errors.reset();
+
+						// De-duplicate error lines (D3DCompiler sometimes repeats the same error multiple times)
+						for (size_t line_offset = 0, next_line_offset; (next_line_offset = d3d_errors_string.find('\n', line_offset)) != std::string::npos; line_offset = next_line_offset + 1)
+						{
+							const std::string_view cur_line(d3d_errors_string.data() + line_offset, next_line_offset - line_offset);
+
+							if (const size_t end_offset = d3d_errors_string.find('\n', next_line_offset + 1);
+								end_offset != std::string::npos)
 							{
-								d3d_errors_string.erase(next_line_offset, end_offset - next_line_offset);
+								const std::string_view next_line(d3d_errors_string.data() + next_line_offset + 1, end_offset - next_line_offset - 1);
+								if (cur_line == next_line)
+								{
+									d3d_errors_string.erase(next_line_offset, end_offset - next_line_offset);
+									next_line_offset = line_offset - 1;
+								}
+							}
+
+							// Also remove D3DCompiler warnings about 'groupshared' specifier used in VS/PS modules
+							if (cur_line.find("X3579") != std::string_view::npos)
+							{
+								d3d_errors_string.erase(line_offset, next_line_offset + 1 - line_offset);
 								next_line_offset = line_offset - 1;
 							}
 						}
 
-						// Also remove D3DCompiler warnings about 'groupshared' specifier used in VS/PS modules
-						if (cur_line.find("X3579") != std::string_view::npos)
+						if (FAILED(hr))
 						{
-							d3d_errors_string.erase(line_offset, next_line_offset + 1 - line_offset);
-							next_line_offset = line_offset - 1;
+							// Add a prefix with the offending entry point name for generic error messages like an out of memory notification
+							if (d3d_errors_string.find("error") == std::string::npos)
+								effect.errors += "error: " + entry_point.name + ": ";
+
+							effect.errors += d3d_errors_string;
+							effect.compiled = false;
+							break;
 						}
-					}
+						else
+						{
+							// Append warnings
+							effect.errors += d3d_errors_string;
+						}
 
-					if (FAILED(hr))
-					{
-						// Add a prefix with the offending entry point name for generic error messages like an out of memory notification
-						if (d3d_errors_string.find("error") == std::string::npos)
-							effect.errors += "error: " + entry_point.name + ": ";
-
-						effect.errors += d3d_errors_string;
-						effect.compiled = false;
-						break;
+						cso.resize(d3d_compiled->GetBufferSize());
+						std::memcpy(cso.data(), d3d_compiled->GetBufferPointer(), cso.size());
 					}
-					else
-					{
-						// Append warnings
-						effect.errors += d3d_errors_string;
-					}
-
-					cso.resize(d3d_compiled->GetBufferSize());
-					std::memcpy(cso.data(), d3d_compiled->GetBufferPointer(), cso.size());
 
 					save_effect_cache(cache_id, "cso", cso);
 				}
 
 				if (!load_effect_cache(cache_id, "asm", cso_text))
 				{
-					const auto D3DDisassemble = reinterpret_cast<pD3DDisassemble>(GetProcAddress(static_cast<HMODULE>(_d3d_compiler_module), "D3DDisassemble"));
-					assert(D3DDisassemble != nullptr);
+					const auto DxcCreateInstance = reinterpret_cast<DxcCreateInstanceProc>(GetProcAddress(static_cast<HMODULE>(_d3d_compiler_module), "DxcCreateInstance"));
+					if (DxcCreateInstance != nullptr)
+					{
+						com_ptr<IDxcCompiler3> compiler;
+						DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler));
+						assert(compiler != nullptr);
 
-					com_ptr<ID3DBlob> d3d_disassembled;
-					if (SUCCEEDED(D3DDisassemble(cso.data(), cso.size(), 0, nullptr, &d3d_disassembled)))
-						cso_text.assign(static_cast<const char *>(d3d_disassembled->GetBufferPointer()), d3d_disassembled->GetBufferSize() - 1);
+						DxcBuffer cso_buffer;
+						cso_buffer.Ptr = cso.data();
+						cso_buffer.Size = cso.size();
+						cso_buffer.Encoding = DXC_CP_ACP;
+
+						com_ptr<IDxcResult> result;
+						compiler->Disassemble(&cso_buffer, IID_PPV_ARGS(&result));
+
+						if (com_ptr<IDxcBlob> d3d_disassembled;
+							result != nullptr &&
+							SUCCEEDED(result->GetOutput(DXC_OUT_DISASSEMBLY, IID_PPV_ARGS(&d3d_disassembled), nullptr)))
+						{
+							cso_text.assign(static_cast<const char *>(d3d_disassembled->GetBufferPointer()), d3d_disassembled->GetBufferSize());
+						}
+					}
+					else
+					{
+						const auto D3DDisassemble = reinterpret_cast<pD3DDisassemble>(GetProcAddress(static_cast<HMODULE>(_d3d_compiler_module), "D3DDisassemble"));
+						assert(D3DDisassemble != nullptr);
+
+						com_ptr<ID3DBlob> d3d_disassembled;
+						if (SUCCEEDED(D3DDisassemble(cso.data(), cso.size(), 0, nullptr, &d3d_disassembled)))
+							cso_text.assign(static_cast<const char *>(d3d_disassembled->GetBufferPointer()), d3d_disassembled->GetBufferSize() - 1);
+					}
 
 					save_effect_cache(cache_id, "asm", cso_text);
 				}
@@ -3486,7 +3577,8 @@ void reshade::runtime::load_effects(bool force_load_all)
 	// Ensure HLSL compiler is loaded before trying to compile effects in Direct3D
 	if (_d3d_compiler_module == nullptr && (_renderer_id & 0xF0000) == 0)
 	{
-		if ((_d3d_compiler_module = LoadLibraryW(L"d3dcompiler_47.dll")) == nullptr &&
+		if ((_device->get_api() != api::device_api::d3d12 || (_d3d_compiler_module = LoadLibraryW(L"dxcompiler.dll")) == nullptr) &&
+			(_d3d_compiler_module = LoadLibraryW(L"d3dcompiler_47.dll")) == nullptr &&
 			(_d3d_compiler_module = LoadLibraryW(L"d3dcompiler_43.dll")) == nullptr)
 		{
 			LOG(ERROR) << "Unable to load HLSL compiler (\"d3dcompiler_47.dll\")!";
